@@ -1606,8 +1606,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     reconnectPromiseGeneration = generationAtStart;
     return nextReconnectPromise;
   }
-  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
-    const sessions = await activeClient.listSessions();
+  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string, knownSessions?: SessionInfo[]): Promise<string | null> {
+    const sessions = knownSessions ?? await activeClient.listSessions();
     const byId = sessions.find(s => s.id === nameOrId);
     if (byId) {
       return byId.id;
@@ -1630,7 +1630,73 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (byIdPrefix.length > 1) {
       throw new Error(`Multiple sessions match ID prefix "${nameOrId}". Use a longer session ID prefix.`);
     }
+    const byNamePrefix = sessions.filter(s => s.name?.toLowerCase().startsWith(lowerName) ?? false);
+    if (byNamePrefix.length === 1) {
+      return byNamePrefix[0]!.id;
+    }
+    if (byNamePrefix.length > 1) {
+      const prefixes = sessionIdPrefixes(sessions);
+      const candidates = byNamePrefix.map((session) => `"${session.name}" (${prefixes.get(session.id)!})`).join(", ");
+      throw new Error(`Multiple session names start with "${nameOrId}": ${candidates}. Use the full name or the id shown in parentheses by "list".`);
+    }
     return null;
+  }
+  function editDistanceAtMost(a: string, b: string, max: number): number {
+    if (Math.abs(a.length - b.length) > max) {
+      return max + 1;
+    }
+    let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    for (let i = 1; i <= a.length; i++) {
+      const row = [i];
+      let rowMinimum = i;
+      for (let j = 1; j <= b.length; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        const value = Math.min(row[j - 1]! + 1, previous[j]! + 1, previous[j - 1]! + cost);
+        row.push(value);
+        if (value < rowMinimum) {
+          rowMinimum = value;
+        }
+      }
+      if (rowMinimum > max) {
+        return max + 1;
+      }
+      previous = row;
+    }
+    return previous[b.length] ?? 0;
+  }
+  function nearestSessionName(sessions: SessionInfo[], to: string): SessionInfo | null {
+    const needle = to.toLowerCase();
+    let best: SessionInfo | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const session of sessions) {
+      if (!session.name) {
+        continue;
+      }
+      const candidate = session.name.toLowerCase();
+      const limit = Math.max(2, Math.floor(Math.max(candidate.length, needle.length) / 4));
+      const distance = editDistanceAtMost(candidate, needle, limit);
+      if (distance <= limit && distance < bestDistance) {
+        best = session;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+  function describeNoSessionMatch(sessions: SessionInfo[], to: string): string {
+    const nearest = nearestSessionName(sessions, to);
+    if (nearest?.name) {
+      const prefixes = sessionIdPrefixes(sessions);
+      return `No connected session matches "${to}". Nearest name: "${nearest.name}" (${prefixes.get(nearest.id) ?? nearest.id.slice(0, 8)}). Run intercom list and address the session by its full name or the id shown in parentheses.`;
+    }
+    return `No connected session matches "${to}". Run intercom list for connected sessions.`;
+  }
+  async function resolveSessionTargetStrict(activeClient: IntercomClient, to: string): Promise<string> {
+    const sessions = await activeClient.listSessions();
+    const resolved = await resolveSessionTarget(activeClient, to, sessions);
+    if (!resolved) {
+      throw new Error(describeNoSessionMatch(sessions, to));
+    }
+    return resolved;
   }
   async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
     if (metadata.orchestratorSessionId) {
@@ -1776,7 +1842,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
       const target: DeliveryTarget = cwd
         ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal })
-        : { id: await resolveSessionTarget(connectedClient, to) ?? to!, label: to! };
+        : { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
       const sendTo = target.id;
       const targetDisplay = target.projectPane ? target.label : to ?? target.label;
       if (sendTo === connectedClient.sessionId) {
@@ -1818,6 +1884,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         retryOf,
       });
       if (!result.delivered) {
+        if (result.reason === "Session not found") {
+          // The broker could not route the raw target either: surface a diagnostic
+          // with the nearest known name instead of the broker's bare wording.
+          const knownSessions = await connectedClient.listSessions().catch(() => []);
+          return {
+            content: [{ type: "text", text: describeNoSessionMatch(knownSessions, targetDisplay) }],
+            details: { ...deliveryDetails(result), error: true },
+          };
+        }
         return {
           content: [{ type: "text", text: undeliveredText(targetDisplay, result) }],
           details: deliveryDetails(result),
@@ -2739,10 +2814,12 @@ Usage:
             if (cwd) {
               target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
             } else {
-              const resolved = await resolveSessionTarget(connectedClient, to);
-              if (!resolved) {
+              let resolved: string;
+              try {
+                resolved = await resolveSessionTargetStrict(connectedClient, to);
+              } catch (error) {
                 return {
-                  content: [{ type: "text", text: `Session "${to}" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects.` }],
+                  content: [{ type: "text", text: `${getErrorMessage(error)} Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects.` }],
                   details: { error: true },
                 };
               }
@@ -2909,10 +2986,12 @@ Usage:
             const mySessionId = connectedClient.sessionId;
             const sessions = await connectedClient.listSessions();
             const pool = getIntercomScopeId();
+            const mySession = sessions.find((session) => session.id === mySessionId);
+            const shortId = (mySessionId ?? "unknown").slice(0, 8);
             return {
               content: [{
                 type: "text",
-                text: `**Intercom status:**\nConnected: Yes\nSession ID: ${mySessionId}${pool ? `\nPool: ${pool}` : ""}\nActive sessions: ${sessions.length}`,
+                text: `**Intercom status:**\nConnected: Yes\nSession ID: ${mySessionId}\nSession name: ${mySession?.name ?? "(unnamed)"} (short id: ${shortId})${pool ? `\nPool: ${pool}` : ""}\nActive sessions: ${sessions.length}`,
               }],
               details: {},
             };

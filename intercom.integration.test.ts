@@ -1613,6 +1613,152 @@ test("intercom tool prefers exact names over ID prefixes", { concurrency: false 
   }
 });
 
+
+test("intercom tool resolves a unique name prefix for send and ask", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { orchestrator, cleanup } = await setupClients();
+  const supervisor = new IntercomClient();
+  const harness = createExtensionHarness("prefix-worker");
+
+  try {
+    await supervisor.connect({ name: "subagent-chat-01a14a54-663b-722b", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "01a14a54-663b-722b-1111-supervisor");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(orchestrator, "prefix-worker");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const received = once(supervisor, "message") as Promise<[SessionInfo, Message]>;
+    const sendResult = await intercomTool.execute("send-name-prefix", { action: "send", to: "subagent-chat-01a14a54-663b", message: "truncated but unique" }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(sendResult.details?.error, true);
+    assert.equal(sendResult.details?.delivery, "socket_delivered");
+    const [asker, sentMessage] = await received;
+    assert.equal(sentMessage.content.text, "truncated but unique");
+
+    const askReceived = once(supervisor, "message") as Promise<[SessionInfo, Message]>;
+    const askPromise = intercomTool.execute("ask-name-prefix", { action: "ask", to: "subagent-chat-01a14a54-663b", message: "truncated ask" }, new AbortController().signal, undefined, harness.ctx);
+    const [, askMessage] = await askReceived;
+    assert.equal(askMessage.content.text, "truncated ask");
+    await supervisor.send(asker.id, { text: "yes", replyTo: askMessage.id });
+    const askResult = await askPromise;
+    assert.notEqual(askResult.details?.error, true);
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    await supervisor.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("intercom tool rejects an ambiguous name prefix with both candidate ids", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const first = new IntercomClient();
+  const second = new IntercomClient();
+  const harness = createExtensionHarness("ambiguity-worker");
+
+  try {
+    await first.connect({ name: "worker-alpha", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "amb-alpha-1111-1111");
+    await second.connect({ name: "worker-beta", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "amb-beta-2222-2222");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const result = await intercomTool.execute("send-ambiguous-prefix", { action: "send", to: "worker-", message: "which one?" }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(result.details?.error, true);
+    assert.match(result.content[0]?.text ?? "", /Multiple session names start with "worker-"/);
+    assert.match(result.content[0]?.text ?? "", /amb-alpha/);
+    assert.match(result.content[0]?.text ?? "", /amb-beta/);
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    await first.disconnect().catch(() => undefined);
+    await second.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("intercom tool send to an unknown target suggests the nearest name", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const supervisor = new IntercomClient();
+  const harness = createExtensionHarness("typo-worker");
+
+  try {
+    await supervisor.connect({ name: "subagent-chat-01a14a54-663b-722b", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "01a14a54-663b-722b-2222-supervisor");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const result = await intercomTool.execute("send-typo-target", { action: "send", to: "subagent-chat-01a14a54-633b", message: "one char off" }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(result.details?.error, true);
+    assert.match(result.content[0]?.text ?? "", /No connected session matches "subagent-chat-01a14a54-633b"/);
+    assert.match(result.content[0]?.text ?? "", /Nearest name: "subagent-chat-01a14a54-663b-722b" \(01a14a54\)/);
+    assert.match(result.content[0]?.text ?? "", /intercom list/);
+    assert.doesNotMatch(result.content[0]?.text ?? "", /Session not found/);
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    await supervisor.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("intercom tool send to an unknown target without a near match points at list", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const harness = createExtensionHarness("void-worker");
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const result = await intercomTool.execute("send-void-target", { action: "send", to: "zzz-void-target", message: "nothing near" }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(result.details?.error, true);
+    assert.match(result.content[0]?.text ?? "", /No connected session matches "zzz-void-target"\. Run intercom list for connected sessions\./);
+    assert.doesNotMatch(result.content[0]?.text ?? "", /Nearest/);
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("intercom ask to an unknown target reports the diagnostic and keeps queueing guidance", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const harness = createExtensionHarness("void-ask-worker");
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const result = await intercomTool.execute("ask-void-target", { action: "ask", to: "zzz-void-target", message: "nobody home" }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(result.details?.error, true);
+    assert.match(result.content[0]?.text ?? "", /No connected session matches "zzz-void-target"/);
+    assert.match(result.content[0]?.text ?? "", /Blocking asks are not queued/);
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("intercom status lists the session name and short id", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  const harness = createExtensionHarness("status-probe", { sessionId: "statusprobe-1111-2222-3333" });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const result = await intercomTool.execute("status-named", { action: "status" }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(result.details?.error, true);
+    assert.match(result.content[0]?.text ?? "", /Session ID: statusprobe-1111-2222-3333/);
+    assert.match(result.content[0]?.text ?? "", /Session name: status-probe \(short id: statuspr\)/);
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    await cleanup();
+  }
+});
 test("extension can pin a restart-stable intercom session id", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
@@ -5068,7 +5214,7 @@ test("an expired pending ask is not inferred; the send remains ordinary", { conc
   });
 });
 
-test("intercom ask fails fast when the target is not currently connected", { concurrency: false }, async () => {
+test("intercom ask fails fast when the target is not connected", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness("offline-ask-worker");
@@ -5090,7 +5236,7 @@ test("intercom ask fails fast when the target is not currently connected", { con
     }, controller.signal, undefined, harness.ctx);
     clearTimeout(timeout);
 
-    assert.match(result.content[0]?.text ?? "", /not currently connected/i);
+    assert.match(result.content[0]?.text ?? "", /No connected session matches/i);
     assert.equal(result.details?.error, true);
   } finally {
     await harness.emitLifecycle("session_shutdown");
