@@ -9,6 +9,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ### Fixed
 - `handover` works when the selected model is a Pi virtual model, such as a router. Before, generating the handover failed with `Virtual model … must be routed before streaming`, because it called `complete()`, which Pi doesn't route. It now uses `streamSimple()`. Thanks to [@colinperel](https://github.com/colinperel) for #176 and #177.
+- A slightly wrong session name failed with a misleading `Session not found`, which reads as if the session had died. This hit `send`, `ask`, and `contact_supervisor` most often with Herdr subagent names like `subagent-chat-…` that were cut short. A name that is not an exact match now resolves to the one connected session whose name starts with it, and the result says which session it resolved to. A message to the exact name of a session that is offline still waits in that session's mailbox and never goes to a different session. If several names start with it, the error lists them. Otherwise the error names the closest session name and points at `intercom list`. `status` now shows the session's own name. Thanks to [@cabi](https://github.com/cabi) for #174 and #175.
 
 ## [0.17.1] - 2026-10-14
 
