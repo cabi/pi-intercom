@@ -860,6 +860,50 @@ test("broker scopes discovery, routing, mailbox, and presence", { concurrency: f
   }
 });
 
+test("broker stays up while its mailbox holds mail and exits once it is delivered", { concurrency: false }, async () => {
+  const broker = spawn(process.execPath, [...tsxImportArgs, path.join(repoDir, "broker", "broker.ts")], {
+    cwd: repoDir,
+    env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const exited = once(broker, "exit");
+  const registration = { name: "idle-mailbox", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() };
+  const sender = new IntercomClient();
+  const offline = new IntercomClient();
+  const target = new IntercomClient();
+  try {
+    await waitForBrokerReady(broker);
+    await sender.connect({ ...registration, name: "idle-mailbox-sender" });
+    await offline.connect(registration, "idle-mailbox-id");
+    await offline.disconnect();
+    await waitForNoSessionId(sender, "idle-mailbox-id");
+    assert.equal((await sender.send("idle-mailbox-id", { messageId: "idle-mailbox-msg", text: "for later" })).delivery, "queued");
+    await sender.disconnect();
+
+    // Past the broker's 5s idle delay with no sessions connected.
+    await new Promise((resolve) => setTimeout(resolve, 6500));
+    assert.equal(broker.exitCode, null, "queued mail keeps the broker running");
+
+    const received: Message[] = [];
+    target.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+    await target.connect(registration, "idle-mailbox-id");
+    await waitForReplyMessage(received, "idle-mailbox-msg");
+    await target.disconnect();
+
+    // Nothing is queued now, so the ordinary idle exit applies.
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("broker did not exit when idle")), 8000);
+    });
+    const [code] = await Promise.race([exited, timeout]).finally(() => clearTimeout(timer));
+    assert.equal(code, 0);
+  } finally {
+    await Promise.all([sender, offline, target].map((client) => client.disconnect().catch(() => undefined)));
+    if (broker.exitCode === null && broker.signalCode === null) broker.kill("SIGTERM");
+    await exited.catch(() => undefined);
+  }
+});
+
 test("broker rotates endpoint epochs and replays same message ids without duplicate delivery", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const replacement = new IntercomClient();
@@ -5305,6 +5349,62 @@ test("multiple pending asks from the same sender leave a send unthreaded and pre
     assert.match(pending.content[0]?.text ?? "", /ambiguous-ask-1/);
     assert.match(pending.content[0]?.text ?? "", /ambiguous-ask-2/);
   } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("send to a disconnected named session says the message is waiting in the mailbox, not sent", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("queued-sender");
+  const offline = new IntercomClient();
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(orchestrator, "queued-sender");
+    await offline.connect({ name: "offline-target", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
+    await waitForSessionByName(orchestrator, "offline-target");
+    await offline.disconnect();
+
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const result = await intercomTool.execute("queued-send", {
+      action: "send",
+      to: "offline-target",
+      message: "For when you are back.",
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    assert.equal(result.details?.delivery, "queued");
+    assert.equal(result.content[0]?.text, 'Session "offline-target" is not connected. The message is waiting in the broker mailbox until that session reconnects.');
+  } finally {
+    await offline.disconnect().catch(() => undefined);
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("a message reaching a session whose context went stale reports an expired receipt", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  let sessionId = "stale-receiver-session";
+  const harness = createExtensionHarness("stale-receiver", { sessionId: () => sessionId });
+  const receipts: string[] = [];
+  const unsubscribe = planner.onMessageReceipt((_from, receipt) => {
+    if (receipt.messageId === "stale-receiver-message") receipts.push(receipt.status);
+  });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const target = await waitForSessionByName(planner, "stale-receiver");
+    sessionId = "stale-receiver-replaced";
+    // Not awaited: expired is not delivery proof, so the send itself waits out the broker's receipt timeout.
+    void planner.send(target.id, { messageId: "stale-receiver-message", text: "Dropped" }).catch(() => undefined);
+    await waitForCondition(() => receipts.includes("expired"), "stale-context expired receipt");
+    assert.equal(harness.sentMessages.length, 0);
+  } finally {
+    unsubscribe();
     await harness.emitLifecycle("session_shutdown");
     await cleanup();
   }
