@@ -1771,7 +1771,6 @@ async function withExactOfflineNameAndLongerOnlineName(run: (harness: ReturnType
     await offline.connect({ name: "worker", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "offline-worker-1111-1111");
     await waitForSessionByName(orchestrator, "worker");
     await offline.disconnect();
-    // "worker-2" is connected and its name starts with "worker".
     const onlineMessages: Message[] = [];
     online.on("message", (_from: SessionInfo, message: Message) => onlineMessages.push(message));
     await online.connect({ name: "worker-2", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "online-worker2-2222-2222");
@@ -3650,23 +3649,26 @@ test("child supervisor blocking requests fail fast when the supervisor is discon
       index: "0",
     }, async () => {
       const harness = createExtensionHarness();
-      piIntercomExtension(harness.pi as never);
-      await harness.emitLifecycle("session_start");
-      const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
-      const updateResult = await supervisorTool.execute("update-1", { reason: "progress_update", message: "Blocked." }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(updateResult.details?.delivered, false);
-      assert.match(updateResult.content[0]?.text ?? "", /No connected session matches "missing-orchestrator"\. Run intercom list/);
-      assert.equal(updateResult.details?.reason, "Session not found");
+      try {
+        piIntercomExtension(harness.pi as never);
+        await harness.emitLifecycle("session_start");
+        const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
+        const updateResult = await supervisorTool.execute("update-1", { reason: "progress_update", message: "Blocked." }, new AbortController().signal, undefined, harness.ctx);
+        assert.equal(updateResult.details?.delivered, false);
+        assert.match(updateResult.content[0]?.text ?? "", /No connected session matches "missing-orchestrator"\. Run intercom list/);
+        assert.equal(updateResult.details?.reason, "Session not found");
 
-      const askResult = await supervisorTool.execute("ask-1", { reason: "need_decision", message: "Which path?" }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(askResult.details?.error, true);
-      assert.match(askResult.content[0]?.text ?? "", /No connected session matches "missing-orchestrator".*Blocking requests are not queued/);
+        const askResult = await supervisorTool.execute("ask-1", { reason: "need_decision", message: "Which path?" }, new AbortController().signal, undefined, harness.ctx);
+        assert.equal(askResult.details?.error, true);
+        assert.match(askResult.content[0]?.text ?? "", /No connected session matches "missing-orchestrator".*Blocking requests are not queued/);
 
-      const secondAskResult = await supervisorTool.execute("ask-2", { reason: "need_decision", message: "Still blocked." }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(secondAskResult.details?.error, true);
-      assert.match(secondAskResult.content[0]?.text ?? "", /Blocking requests are not queued/);
-      assert.doesNotMatch(secondAskResult.content[0]?.text ?? "", /Already waiting/);
-      await harness.emitLifecycle("session_shutdown");
+        const secondAskResult = await supervisorTool.execute("ask-2", { reason: "need_decision", message: "Still blocked." }, new AbortController().signal, undefined, harness.ctx);
+        assert.equal(secondAskResult.details?.error, true);
+        assert.match(secondAskResult.content[0]?.text ?? "", /Blocking requests are not queued/);
+        assert.doesNotMatch(secondAskResult.content[0]?.text ?? "", /Already waiting/);
+      } finally {
+        await harness.emitLifecycle("session_shutdown");
+      }
     });
   } finally {
     await cleanup();
@@ -3701,6 +3703,45 @@ test("child supervisor tool resolves a truncated unique supervisor name on the f
       }
     });
   } finally {
+    await cleanup();
+  }
+});
+
+test("child supervisor blocking request to an offline stable supervisor id is not captured by a longer live name", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { orchestrator, cleanup } = await setupClients();
+  const offlineSupervisor = new IntercomClient();
+  const live = new IntercomClient();
+  const liveMessages: Message[] = [];
+  live.on("message", (_from: SessionInfo, message: Message) => liveMessages.push(message));
+
+  try {
+    await offlineSupervisor.connect({ name: "subagent-chat-01a14a54-663b-722b", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "01a14a54-663b-722b-3333-supervisor");
+    await waitForSessionByName(orchestrator, "subagent-chat-01a14a54-663b-722b");
+    await offlineSupervisor.disconnect();
+    await live.connect({ name: "subagent-chat-01a14a54-663b-722b-2", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "live-extends-4444-4444");
+    await waitForSessionByName(orchestrator, "subagent-chat-01a14a54-663b-722b-2");
+    await withChildOrchestratorEnv({ orchestratorTarget: "subagent-chat-01a14a54-663b", orchestratorSessionId: "01a14a54-663b-722b-3333-supervisor", runId: "78f659a3", agent: "worker", index: "0" }, async () => {
+      const harness = createExtensionHarness("stable-id-child");
+      try {
+        piIntercomExtension(harness.pi as never);
+        await harness.emitLifecycle("session_start");
+        const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1000);
+        const result = await supervisorTool.execute("ask-offline-stable-id", { reason: "need_decision", message: "Which path?" }, controller.signal, undefined, harness.ctx);
+        clearTimeout(timeout);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.deepEqual(liveMessages.map((m) => m.content.text), []);
+        assert.equal(result.details?.error, true);
+        assert.match(result.content[0]?.text ?? "", /not currently connected/);
+      } finally {
+        await harness.emitLifecycle("session_shutdown");
+      }
+    });
+  } finally {
+    await offlineSupervisor.disconnect().catch(() => undefined);
+    await live.disconnect().catch(() => undefined);
     await cleanup();
   }
 });
